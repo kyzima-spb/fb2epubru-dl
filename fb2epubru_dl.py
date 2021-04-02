@@ -1,7 +1,9 @@
 from collections import OrderedDict
+from functools import lru_cache
 from itertools import count
 import logging
 import os
+from pathlib import Path
 from string import whitespace
 from time import sleep
 import urllib.parse
@@ -17,15 +19,29 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
-def download(url, path, chunk_size=1024):
+def download(url, referer, path, chunk_size=1024):
     """Downloads a file from the specified address."""
-    resp = requests.get(url, stream=True)
+    resp = make_session().get(url, stream=True, headers={
+        'referer': referer,
+    })
 
     with open(path, 'wb') as f:
         for chunk in resp.iter_content(chunk_size):
             f.write(chunk)
 
     return path
+
+
+@lru_cache()
+def make_session():
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0',
+        'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
+        'Pragma': 'no-cache',
+        'Cache-Control': 'no-cache',
+    })
+    return session
 
 
 class MultipleElementsFoundError(Exception):
@@ -74,7 +90,7 @@ class Parser(object):
 
     def send(self, url, **kwargs):
         """Выполняет GET запрос и возвращает объект-ответа."""
-        return requests.get(self.get_abs_url(url), **kwargs)
+        return make_session().get(self.get_abs_url(url), **kwargs)
 
     def get_book(self, url):
         """Возвращает полную информацию о книге."""
@@ -89,6 +105,7 @@ class Parser(object):
             error_message='CSS selector for retrieving book authors has been changed.'
         )
         book = {
+            'url': url,
             'authors': [
                 dict(name=a.text, url=self.get_abs_url(a.get('href'))) for a in authors
             ],
@@ -224,17 +241,14 @@ def main(query, dest, filename_template, file_format):
                            length=len(books)) as bar:
         for book in bar:
             url = book.get(f'{file_format}_url')
-            path = os.path.join(dest, book['author'])
+            path = Path(dest, book['author'])
 
-            if not os.path.exists(path):
+            if not path.exists():
                 os.mkdir(path, 0o755)
 
-            path = os.path.join(path, filename_template.format(
+            path = path / filename_template.format(
                 author=book['author'], title=book['title']
-            ))
+            )
 
-            _, ext = os.path.splitext(url)
-            path += ext
-
-            download(url, path)
+            download(url, book['url'], path.with_suffix(f'.{file_format}'))
             sleep(0.5)
