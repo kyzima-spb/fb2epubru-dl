@@ -1,12 +1,20 @@
 from collections import OrderedDict
-import math
+from itertools import count
+import logging
 import os
 from string import whitespace
 from time import sleep
+import urllib.parse
 
 import click
 import requests
 from lxml.html import fromstring
+
+
+logging.basicConfig(level=logging.DEBUG)
+
+
+logger = logging.getLogger(__name__)
 
 
 def download(url, path, chunk_size=1024):
@@ -26,22 +34,34 @@ class MultipleElementsFoundError(Exception):
         self.found = found
 
 
+class BadSelector(Exception):
+    def __init__(self, selector, *args):
+        super().__init__(*args)
+        self.selector = selector
+
+
 class Parser(object):
     BASE_URL = 'https://fb2-epub.ru'
 
     def get_abs_url(self, url):
         """Возвращает абсолютный URL-адрес."""
-        return f'{self.BASE_URL}{url}'
+        return urllib.parse.urljoin(self.BASE_URL, url)
 
-    def findall(self, selector, url=None, tree=None):
+    def findall(self, selector, url=None, tree=None, error_message=None):
         """Выбырает по CSS-селектору HTML-элементы и возвращает все найденные."""
         if tree is None:
             tree = self.make_tree(self.send(url))
-        return tree.cssselect(selector)
 
-    def findone(self, selector, url=None, tree=None):
+        found = tree.cssselect(selector)
+
+        if not found and error_message:
+            raise BadSelector(selector, error_message)
+
+        return found
+
+    def findone(self, selector, url=None, tree=None, error_message=None):
         """Выбырает по CSS-селектору один HTML-элемент и возвращает его, либо None."""
-        found = self.findall(selector, url=url, tree=tree)
+        found = self.findall(selector, url=url, tree=tree, error_message=error_message)
 
         if len(found) > 1:
             raise MultipleElementsFoundError(found)
@@ -58,45 +78,77 @@ class Parser(object):
 
     def get_book(self, url):
         """Возвращает полную информацию о книге."""
-        elem = self.findone('.eText', url)
-        book = {}
+        elem = self.findone(
+            selector='#dle-content',
+            url=url,
+            error_message='CSS selector for retrieving book has been changed.'
+        )
+        authors = self.findall(
+            selector='#msg > :first-child a',
+            tree=elem,
+            error_message='CSS selector for retrieving book authors has been changed.'
+        )
+        book = {
+            'authors': [
+                dict(name=a.text, url=self.get_abs_url(a.get('href'))) for a in authors
+            ],
+            'title': authors[-1].tail.strip(whitespace + '.'),
+        }
 
-        author = elem.find('h1').find('a')
-        book['author'] = author.text
-        book['author_url'] = self.get_abs_url(author.get('href'))
+        book['author'] = ', '.join(a['name'] for a in book['authors'])
 
-        book['title'] = author.tail.strip(whitespace + '.')
+        # description = [e.text.strip() for e in self.findall('p', tree=elem) if e.text]
+        # book['description'] = '\n'.join(description)
 
-        description = [e.text.strip() for e in self.findall('p', tree=elem) if e.text]
-        book['description'] = '\n'.join(description)
-
-        fb2_url = self.findone('div a[href$=".zip"]', tree=elem)
+        fb2_url = self.findone(
+            selector='#download .loadbuttons__button-fb2 .loadbuttons__button-size',
+            tree=elem,
+            error_message='CSS selector for retrieving FB2 has been changed.'
+        )
 
         if fb2_url is not None:
-            book['fb2_url'] = self.get_abs_url(fb2_url.get('href'))
+            book['fb2_url'] = fb2_url.get('data-link')
 
-        epub_url = self.findone('div a[href$=".epub"]', tree=elem)
+        epub_url = self.findone(
+            selector='#download .loadbuttons__button-epub .loadbuttons__button-size',
+            tree=elem,
+            error_message='CSS selector for retrieving EPUB has been changed.'
+        )
 
         if epub_url is not None:
-            book['epub_url'] = self.get_abs_url(epub_url.get('href'))
+            book['epub_url'] = epub_url.get('data-link')
 
         return book
 
     def get_index(self):
         """Возвращает алфавитный указатель в виде словаря."""
-        return {a.text.lower(): a.get('href') for a in self.findall('#s1 a', '/')}
+        index = self.findall(
+            selector='main .header__menu a',
+            url='/',
+            error_message='CSS selector for retrieving index has been changed.'
+        )
+        return {a.text.lower(): a.get('href') for a in index}
 
     def search(self, query):
         """Выполняет поиск в каталоге по алфавитному указателю."""
         first_letter = query[0].lower()
         url = self.get_index().get(first_letter)
 
+        logger.debug(f'Поисковый запрос: "{query}" ({self.get_abs_url(url)})')
+
         if url:
-            for a in self.findall(f'h2 + p a:contains("{query}")', url):
+            authors_list = self.findall(
+                selector=f'h1.block__title ~ a:contains("{query}")',
+                url=url,
+                error_message='CSS selector for retrieving authors list has been changed.'
+            )
+
+            for a in authors_list:
                 yield a.get('href'), a.text
 
     def iter_books(self, url):
         """Итетирует все книги с учетом пагинации с первой переданной страницы."""
+        logger.debug(f'Создан итератор по книгам для адреса: {self.get_abs_url(url)}')
         return BookIterator(self, url)
 
 
@@ -105,18 +157,33 @@ class BookIterator(object):
         self.parser = parser
         self.base_url = base_url
 
-        show_count_element = self.parser.findone('.numShown73', url=self.base_url)
+        count_element = self.parser.findone(
+            '.main__h1-wrapper p',
+            url=self.base_url,
+            error_message='CSS selector for retrieving number of books by the author has been changed.'
+        )
 
-        self.show_count = int(show_count_element.text.split('-').pop())
-        self.count = int(show_count_element.getparent().getparent().find('b').text)
+        self.books_count = int(count_element.text.split(': ').pop())
 
     def __iter__(self):
-        if self.count:
-            count_pages = math.ceil(self.count / self.show_count) + 1
+        if self.books_count:
+            received = 0
+            page = count(start=1)
 
-            for i in range(1, count_pages):
-                for a in self.parser.findall('#allEntries .My a', url=f'{self.base_url}-{i}'):
+            while received < self.books_count:
+                books_urls = self.parser.findall(
+                    selector='#dle-content .entry__title a',
+                    url=f'{self.base_url}/page/{next(page)}',
+                    error_message='CSS selector for retrieving books list has been changed.'
+                )
+
+                for a in books_urls:
                     yield self.parser.get_book(a.get('href'))
+
+                received += len(books_urls)
+
+    def __len__(self):
+        return self.books_count
 
 
 def make_select_menu(iterable):
@@ -154,7 +221,7 @@ def main(query, dest, filename_template, file_format):
 
     with click.progressbar(books, label='Downloading books',
                            fill_char=click.style('#', fg='green'),
-                           length=books.count) as bar:
+                           length=len(books)) as bar:
         for book in bar:
             url = book.get(f'{file_format}_url')
             path = os.path.join(dest, book['author'])
@@ -170,4 +237,4 @@ def main(query, dest, filename_template, file_format):
             path += ext
 
             download(url, path)
-            sleep(0.1)
+            sleep(0.5)
